@@ -7,6 +7,15 @@
 
 import Foundation
 
+private let FeatureFlagsLock = DispatchSemaphore(value: 1)
+internal func FeatureFlagsPerformProtected<P>(_ callback: () -> P) -> P {
+    FeatureFlagsLock.wait()
+    defer {
+        FeatureFlagsLock.signal()
+    }
+    return callback()
+}
+
 private func checkArguments(_ name: String, descriptor: FlagDomainDescriptor, priorityDefault: Bool? = nil, defaultValue: Bool) -> Bool {
     #if !DEBUG
     // Non-debug builds must always evaluate debugging flags to false.
@@ -77,7 +86,9 @@ internal class FlagDomain {
                 return
             }
             
-            self.applyKVOUpdate(newValue)
+            FeatureFlagsPerformProtected {
+                self.applyKVOUpdate(newValue)
+            }
         }
         suite.addObserver(observer, forKeyPath: key, options: [.new], context: nil)
         self.observer = observer
@@ -116,22 +127,31 @@ internal class FlagDomain {
             suite.dictionary(forKey: key) ?? [:]
         }
         set {
-            suite.set(newValue, forKey: key)
+            FeatureFlagsPerformProtected {
+                suite.set(newValue, forKey: key)
+            }
         }
     }
     
     subscript (flag: FeatureFlag) -> Bool {
         get {
             if _slowPath(!cache.keys.contains(flag)) {
-                let boolean = boolean(forFlag: flag, priorityDefault: container[flag.key] as? Bool)
-                cache[flag] = boolean
-                return boolean
+                return FeatureFlagsPerformProtected {
+                    if let value = cache[flag] {
+                        return value
+                    }
+                    let boolean = boolean(forFlag: flag, priorityDefault: container[flag.key] as? Bool)
+                    cache[flag] = boolean
+                    return boolean
+                }
             }
             return cache[flag]!
         }
         set {
-            container[flag.key] = newValue
-            cache[flag] = newValue
+            FeatureFlagsPerformProtected {
+                container[flag.key] = newValue
+                cache[flag] = newValue
+            }
         }
     }
 }
@@ -147,9 +167,14 @@ internal extension FlagDomain {
     static func domain(forDescriptor descriptor: FlagDomainDescriptor, suiteName: String) -> FlagDomain {
         let tuple = Pair.some(descriptor, suiteName)
         if _slowPath(!cache.keys.contains(tuple)) {
-            let domain = FlagDomain(descriptor: descriptor, suiteName: suiteName)
-            cache[tuple] = domain
-            return domain
+            return FeatureFlagsPerformProtected { () -> FlagDomain in
+                if let domain = cache[tuple] {
+                    return domain
+                }
+                let domain = FlagDomain(descriptor: descriptor, suiteName: suiteName)
+                cache[tuple] = domain
+                return domain
+            }
         }
         return cache[tuple]!
     }
@@ -163,9 +188,11 @@ internal extension FlagDomain {
     
     /// Remove a flag from NSUserDefaults and refreshes the underlying flag value
     func unsetBoolean(forFlag flag: FeatureFlag) {
-        container.removeValue(forKey: flag.key)
-        // reclculate flag without userdefaults
-        cache[flag] = boolean(forFlag: flag, priorityDefault: nil)
+        FeatureFlagsPerformProtected {
+            container.removeValue(forKey: flag.key)
+            // reclculate flag without userdefaults
+            cache[flag] = boolean(forFlag: flag, priorityDefault: nil)
+        }
     }
     
     /// Whether a flag has a value in NSUserDefaults
@@ -176,7 +203,12 @@ internal extension FlagDomain {
     /// Establish a relationship between a flag and domain
     func notice(flag: FeatureFlag) {
         if _slowPath(!flags.keys.contains(flag.key)) {
-            flags[flag.key] = flag
+            FeatureFlagsPerformProtected {
+                if flags[flag.key] != nil {
+                    return
+                }
+                flags[flag.key] = flag
+            }
         }
     }
 }
