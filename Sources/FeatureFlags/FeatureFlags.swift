@@ -37,6 +37,18 @@ public enum FlagDomainDescriptor: CaseIterable {
 
 @propertyWrapper
 public struct FeatureFlag: Hashable {
+    public static func == (lhs: FeatureFlag, rhs: FeatureFlag) -> Bool {
+        lhs.key == rhs.key
+        && lhs.domainDescriptor == rhs.domainDescriptor
+        && lhs.defaultValue() == rhs.defaultValue()
+    }
+    
+    public func hash(into hasher: inout Hasher) {
+        key.hash(into: &hasher)
+        domainDescriptor.hash(into: &hasher)
+        defaultValue().hash(into: &hasher)
+    }
+    
     @_transparent private static func domain(forFlag flag: FeatureFlag, suiteName: String) -> FlagDomain {
         let domain = FlagDomain.domain(forDescriptor: flag.domainDescriptor, suiteName: suiteName)
         domain.notice(flag: flag)
@@ -80,9 +92,9 @@ public struct FeatureFlag: Hashable {
     /// The descriptor for this flag - using the debugging domain will always evaluate to false in non-debug builds.
     public let domainDescriptor: FlagDomainDescriptor
     /// The value of the flag when it is not defined as an argument or in defaults
-    public let defaultValue: Bool
+    public let defaultValue: () -> Bool
     
-    public init(_ key: String, domain: FlagDomainDescriptor = .feature, defaultValue: Bool) {
+    public init(_ key: String, domain: FlagDomainDescriptor = .feature, defaultValue: @autoclosure @escaping () -> Bool) {
         self.key = key
         self.domainDescriptor = domain
         self.defaultValue = defaultValue

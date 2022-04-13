@@ -38,7 +38,7 @@ private func boolean(forFlag flag: FeatureFlag, priorityDefault: @autoclosure ()
         flag.key,
         descriptor: flag.domainDescriptor,
         priorityDefault: priorityDefault(),
-        defaultValue: flag.defaultValue
+        defaultValue: flag.defaultValue()
     )
 }
 
@@ -53,17 +53,17 @@ private extension FlagDomainDescriptor {
     }
 }
 
-internal class FlagDomain {
+@_spi(featureFlagInternals) public class FlagDomain {
     private class NSKVOObserver: NSObject {
-        typealias Callback = (String?, Any?, [NSKeyValueChangeKey: Any]?) -> ()
-        var callback: Callback
+        typealias Callback = (NSKVOObserver, String?, Any?, [NSKeyValueChangeKey: Any]?) -> ()
+        var callback: Callback?
         
         init(_ callback: @escaping Callback) {
             self.callback = callback
         }
         
         override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-            callback(keyPath, object, change)
+            callback?(self, keyPath, object, change)
         }
     }
     
@@ -77,7 +77,11 @@ internal class FlagDomain {
         self.suiteName = suiteName
         self.suite = UserDefaults(suiteName: suiteName)!
         
-        let observer = NSKVOObserver { keyPath, object, change in
+        let observer = NSKVOObserver { [weak self] observer, keyPath, object, change in
+            guard let self = self else {
+                return
+            }
+            
             guard let newValue = change?[.newKey] as? [String: Any] else {
                 return
             }
@@ -86,39 +90,46 @@ internal class FlagDomain {
                 return
             }
             
-            FeatureFlagsPerformProtected {
-                self.applyKVOUpdate(newValue)
-            }
+            self.applyKVOUpdate(newValue)
         }
         suite.addObserver(observer, forKeyPath: key, options: [.new], context: nil)
         self.observer = observer
     }
     
-    private var cache: [FeatureFlag: Bool] = [:]
-    private var flags: [String: FeatureFlag] = [:]
+    deinit {
+        if let observer = observer {
+            suite.removeObserver(observer, forKeyPath: key)
+        }
+    }
+    
+    @_spi(featureFlagInternals) public var cache: NSMapTable<NSNumber, NSNumber> = .strongToStrongObjects()
+    @_spi(featureFlagInternals) public var flags: [String: FeatureFlag] = [:]
+    @_spi(featureFlagInternals) public var seenFlags: NSHashTable<NSString> = .init(options: .copyIn)
     
     private func applyKVOUpdate(_ dict: [String: Any]) {
-        let changedKeys = dict.keys
-        let undefinedFlags = cache.keys.filter {
-            !changedKeys.contains($0.key)
-        }
-        
-        cache = [:]
-        
-        for (key, value) in dict {
-            guard let flag = flags[key] else {
-                continue
+        FeatureFlagsPerformProtected {
+            let changedKeys = dict.keys
+            let undefinedFlags = flags.filter {
+                !changedKeys.contains($0.key)
             }
             
-            if let value = value as? Bool {
-                cache[flag] = value
-            } else if let flag = flags[key] {
-                cache[flag] = boolean(forFlag: flag, priorityDefault: nil)
+            cache = .strongToStrongObjects()
+            
+            for (key, value) in dict {
+                guard let flag = flags[key] else {
+                    continue
+                }
+                
+                if let value = value as? Bool {
+                    self[cache: flag] = value
+                } else if let flag = flags[key] {
+                    self[cache: flag] = boolean(forFlag: flag, priorityDefault: nil)
+                }
             }
-        }
-        
-        for flag in undefinedFlags {
-            cache[flag] = boolean(forFlag: flag, priorityDefault: nil)
+            
+            for flag in undefinedFlags.lazy.map(\.value) {
+                self[cache: flag] = boolean(forFlag: flag, priorityDefault: nil)
+            }
         }
     }
     
@@ -135,48 +146,72 @@ internal class FlagDomain {
     
     subscript (flag: FeatureFlag) -> Bool {
         get {
-            if _slowPath(!cache.keys.contains(flag)) {
-                return FeatureFlagsPerformProtected {
-                    if let value = cache[flag] {
-                        return value
-                    }
-                    let boolean = boolean(forFlag: flag, priorityDefault: container[flag.key] as? Bool)
-                    cache[flag] = boolean
-                    return boolean
-                }
+            let cached = self[cache: flag]
+            if _fastPath(cached != nil) {
+                return cached!
             }
-            return cache[flag]!
+            return FeatureFlagsPerformProtected {
+                if let value = self[cache: flag] {
+                    return value
+                }
+                let boolean = boolean(forFlag: flag, priorityDefault: container[flag.key] as? Bool)
+                self[cache: flag] = boolean
+                return boolean
+            }
         }
         set {
             FeatureFlagsPerformProtected {
                 container[flag.key] = newValue
-                cache[flag] = newValue
+                self[cache: flag] = newValue
             }
         }
     }
 }
 
-internal extension FlagDomain {
-    private static var cache: [Pair<FlagDomainDescriptor, String>: FlagDomain] = [:]
+extension FlagDomain {
+    @_spi(featureFlagInternals) public static var cache: NSMapTable<NSNumber, FlagDomain> = .strongToStrongObjects()
     
+    static subscript (cache descriptor: Pair<FlagDomainDescriptor, String>) -> FlagDomain? {
+        @_transparent get {
+            cache.object(forKey: descriptor.hashValue as NSNumber)
+        }
+        @_transparent set {
+            cache.setObject(newValue, forKey: descriptor.hashValue as NSNumber)
+        }
+    }
+}
+
+extension FlagDomain {
+    subscript (cache flag: FeatureFlag) -> Bool? {
+        @_transparent get {
+            cache.object(forKey: flag.hashValue as NSNumber)?.boolValue
+        }
+        @_transparent set {
+            cache.setObject(newValue.map(NSNumber.init(booleanLiteral:)), forKey: flag.hashValue as NSNumber)
+        }
+    }
+}
+
+internal extension FlagDomain {
     static var allDomains: [FlagDomain] {
-        Array(cache.values)
+        cache.objectEnumerator().map { Array($0).compactMap { $0 as? FlagDomain } } ?? []
     }
     
     /// Returns the appropriate domain instance for the given descriptor/suiteName
     static func domain(forDescriptor descriptor: FlagDomainDescriptor, suiteName: String) -> FlagDomain {
         let tuple = Pair.some(descriptor, suiteName)
-        if _slowPath(!cache.keys.contains(tuple)) {
+        let domain = self[cache: tuple]
+        if _slowPath(domain == nil) {
             return FeatureFlagsPerformProtected { () -> FlagDomain in
-                if let domain = cache[tuple] {
+                if let domain = self[cache: tuple] {
                     return domain
                 }
                 let domain = FlagDomain(descriptor: descriptor, suiteName: suiteName)
-                cache[tuple] = domain
+                self[cache: tuple] = domain
                 return domain
             }
         }
-        return cache[tuple]!
+        return domain!
     }
 }
 
@@ -191,7 +226,7 @@ internal extension FlagDomain {
         FeatureFlagsPerformProtected {
             container.removeValue(forKey: flag.key)
             // reclculate flag without userdefaults
-            cache[flag] = boolean(forFlag: flag, priorityDefault: nil)
+            self[cache: flag] = boolean(forFlag: flag, priorityDefault: nil)
         }
     }
     
@@ -202,12 +237,13 @@ internal extension FlagDomain {
     
     /// Establish a relationship between a flag and domain
     func notice(flag: FeatureFlag) {
-        if _slowPath(!flags.keys.contains(flag.key)) {
+        if _slowPath(!seenFlags.contains(flag.key as NSString)) {
             FeatureFlagsPerformProtected {
                 if flags[flag.key] != nil {
                     return
                 }
                 flags[flag.key] = flag
+                seenFlags.add(flag.key as NSString)
             }
         }
     }
@@ -222,11 +258,11 @@ private extension FlagDomain {
 // MARK: - Conformances
 
 extension FlagDomain: Hashable {
-    static func == (lhs: FlagDomain, rhs: FlagDomain) -> Bool {
+    @_spi(featureFlagInternals) public static func == (lhs: FlagDomain, rhs: FlagDomain) -> Bool {
         lhs === rhs
     }
     
-    func hash(into hasher: inout Hasher) {
+    @_spi(featureFlagInternals) public func hash(into hasher: inout Hasher) {
         descriptor.hash(into: &hasher)
         suiteName.hash(into: &hasher)
         key.hash(into: &hasher)

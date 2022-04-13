@@ -7,7 +7,7 @@
 
 import Foundation
 
-internal enum Pair<A: Hashable, B: Hashable>: Hashable {
+@_spi(featureFlagInternals) public enum Pair<A: Hashable, B: Hashable>: Hashable {
     // In terms of Swift memory, a single-case enum is equivalent to a tuple.
     // So, we get a hashable tuple. Yay.
     case some(A,B)
